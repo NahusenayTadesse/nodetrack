@@ -1,0 +1,7 @@
+/nodetrack
+/nodetrack-arm64
+*.db
+*.db-wal
+*.db-shm
+/internal/web/dist/
+.playwright-mcp/

@@ -1,0 +1,32 @@
+[Unit]
+Description=nodetrack - Node.js/Bun app monitor
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/nodetrack -db /var/lib/nodetrack/nodetrack.db -listen 127.0.0.1:9100
+# Optional basic auth for the dashboard:
+# Environment=NODETRACK_USER=admin NODETRACK_PASS=change-me
+
+# No root needed: these two capabilities are enough to read other users'
+# /proc/<pid>/{exe,cwd,fd,io,environ,smaps_rollup} and their package.json.
+# If your /proc is mounted with hidepid=, run as root instead (drop DynamicUser
+# and the capability lines).
+DynamicUser=yes
+StateDirectory=nodetrack
+AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryHigh=32M
+MemoryMax=64M
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
