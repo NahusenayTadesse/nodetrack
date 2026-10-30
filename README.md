@@ -33,12 +33,35 @@ Every tick nodetrack scans `/proc`:
    listens on a TCP port, sits behind a proxied unix socket, runs under pm2 or
    a systemd service, or matches `-include`.
 
-Domains come from parsing `nginx.conf` (following `include` globs, upstreams,
+Domains come from OpenLiteSpeed/CyberPanel vhost configs (listener maps,
+`extprocessor` proxies, `context` and `.htaccess` rewrite rules), from parsing `nginx.conf` (following `include` globs, upstreams,
 `set $var`, unix sockets; re-parsed only when files change) and from Caddy's
 admin API (`:2019/config/`, works for Caddyfile setups too).
 
 History: raw samples for 6h, 1-minute rollups for 8 days, hourly for 400 days.
 Events: `discovered`, `start`, `stop`, `restart`.
+
+## Controls (opt-in)
+
+Start with `-controls` (basic auth required) to manage apps from the dashboard:
+
+- **Start / stop / restart**: `systemctl` for systemd services, `pm2` (as the
+  pm2 owner) for pm2 apps. Hand-started apps can only be stopped.
+- **`install` and package scripts**: the package manager comes from the
+  lockfile (npm, pnpm, yarn, bun) and the binary from next to the app's own
+  runtime. Only scripts listed in `package.json` can run. Jobs run **as the
+  owner of the app's directory**, never as root. As root, each job gets its own
+  transient systemd unit, so a big `npm install` doesn't count against the
+  tracker's memory limit. Output streams live to the browser; at most 2 jobs
+  run at once, with a 30 min timeout.
+- **Point a domain at an app** (OpenLiteSpeed/CyberPanel): rewrites the site's
+  proxy backend, or puts a proxy in front of a static site. A separate root
+  helper backs up every file, gracefully restarts OpenLiteSpeed and rolls back
+  if it doesn't come back healthy. nginx/Caddy domains are read-only.
+
+Every action and job is recorded in the app's event log. State-changing
+requests must carry an `X-Nodetrack: 1` header, which blocks cross-site
+requests from riding on the browser's saved login.
 
 ## Build and install
 
@@ -53,6 +76,9 @@ scp nodetrack root@vps:/usr/local/bin/
 scp deploy/nodetrack.service root@vps:/etc/systemd/system/
 ssh root@vps systemctl enable --now nodetrack
 ```
+
+On CyberPanel, `deploy/install-cyberpanel.sh <domain>` does everything: the root
+service (with controls), the website, Let's Encrypt, and the reverse proxy.
 
 The dashboard listens on `127.0.0.1:9100`. Put it behind your reverse proxy
 (the SSE stream sets `X-Accel-Buffering: no` for nginx), and set
@@ -69,6 +95,8 @@ The dashboard listens on `127.0.0.1:9100`. Put it behind your reverse proxy
 | `-nginx` | `/etc/nginx/nginx.conf` | `""` disables |
 | `-caddy` | `http://127.0.0.1:2019` | `""` disables |
 | `-include` / `-exclude` | | regexp over `cwd + argv` |
+| `-controls` | off | enable the controls above (needs basic auth) |
+| `-ols` | `/usr/local/lsws/conf/httpd_config.conf` | OpenLiteSpeed config, `""` disables |
 
 `GOMEMLIMIT` and `GOGC` default to 24 MiB and 50 unless set.
 

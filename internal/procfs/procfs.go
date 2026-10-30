@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Root is the procfs mount point. Overridable for tests.
@@ -145,6 +146,18 @@ func (r *Reader) Stat(pid int) (Stat, error) {
 func Exe(pid int) (string, error) {
 	s, err := os.Readlink(pidPath(pid, "exe"))
 	return strings.TrimSuffix(s, " (deleted)"), err
+}
+
+// UID returns the owner of the process, or -1.
+func UID(pid int) int {
+	fi, err := os.Stat(Root + "/" + strconv.Itoa(pid))
+	if err != nil {
+		return -1
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return int(st.Uid)
+	}
+	return -1
 }
 
 func Cwd(pid int) (string, error) { return os.Readlink(pidPath(pid, "cwd")) }

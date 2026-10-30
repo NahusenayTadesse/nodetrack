@@ -94,7 +94,36 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// Columns added after v0.1, applied to existing databases in place.
+var addedColumns = []struct{ table, column, decl string }{
+	{"apps", "exe", "TEXT NOT NULL DEFAULT ''"},
+	{"apps", "pkg_dir", "TEXT NOT NULL DEFAULT ''"},
+	{"apps", "entry", "TEXT NOT NULL DEFAULT ''"},
+	{"apps", "uid", "INTEGER NOT NULL DEFAULT -1"},
+	{"apps", "pm2_home", "TEXT NOT NULL DEFAULT ''"},
+}
+
+func migrate(db *sql.DB) error {
+	for _, c := range addedColumns {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`,
+			c.table, c.column).Scan(&n); err != nil {
+			return err
+		}
+		if n == 0 {
+			if _, err := db.Exec(`ALTER TABLE ` + c.table + ` ADD COLUMN ` + c.column + ` ` + c.decl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -116,10 +145,16 @@ type App struct {
 	RootStart  int64
 	FirstSeen  int64
 	LastSeen   int64
+	Exe        string
+	PkgDir     string
+	Entry      string
+	UID        int
+	PM2Home    string
 }
 
 const appCols = `id, key, name, runtime, source, unit, cwd, command, pkg_version,
-	ports, sockets, domains, root_pid, root_start, first_seen, last_seen`
+	ports, sockets, domains, root_pid, root_start, first_seen, last_seen,
+	exe, pkg_dir, entry, uid, pm2_home`
 
 func (s *Store) Apps() ([]App, error) {
 	rows, err := s.db.Query(`SELECT ` + appCols + ` FROM apps`)
@@ -132,7 +167,8 @@ func (s *Store) Apps() ([]App, error) {
 		var a App
 		if err := rows.Scan(&a.ID, &a.Key, &a.Name, &a.Runtime, &a.Source, &a.Unit,
 			&a.Cwd, &a.Command, &a.PkgVersion, &a.Ports, &a.Sockets, &a.Domains,
-			&a.RootPID, &a.RootStart, &a.FirstSeen, &a.LastSeen); err != nil {
+			&a.RootPID, &a.RootStart, &a.FirstSeen, &a.LastSeen,
+			&a.Exe, &a.PkgDir, &a.Entry, &a.UID, &a.PM2Home); err != nil {
 			return nil, err
 		}
 		out = append(out, a)
@@ -142,10 +178,12 @@ func (s *Store) Apps() ([]App, error) {
 
 func (s *Store) InsertApp(a *App) error {
 	res, err := s.db.Exec(`INSERT INTO apps (key, name, runtime, source, unit, cwd,
-		command, pkg_version, ports, sockets, domains, root_pid, root_start, first_seen, last_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		command, pkg_version, ports, sockets, domains, root_pid, root_start, first_seen, last_seen,
+		exe, pkg_dir, entry, uid, pm2_home)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		a.Key, a.Name, a.Runtime, a.Source, a.Unit, a.Cwd, a.Command, a.PkgVersion,
-		a.Ports, a.Sockets, a.Domains, a.RootPID, a.RootStart, a.FirstSeen, a.LastSeen)
+		a.Ports, a.Sockets, a.Domains, a.RootPID, a.RootStart, a.FirstSeen, a.LastSeen,
+		a.Exe, a.PkgDir, a.Entry, a.UID, a.PM2Home)
 	if err != nil {
 		return err
 	}
@@ -176,7 +214,8 @@ func (s *Store) WriteTick(ts int64, apps []*App, samples []Sample, events []Even
 	defer tx.Rollback()
 	if len(apps) > 0 {
 		st, err := tx.Prepare(`UPDATE apps SET name=?, source=?, unit=?, cwd=?, command=?,
-			pkg_version=?, ports=?, sockets=?, domains=?, root_pid=?, root_start=?, last_seen=?
+			pkg_version=?, ports=?, sockets=?, domains=?, root_pid=?, root_start=?, last_seen=?,
+			exe=?, pkg_dir=?, entry=?, uid=?, pm2_home=?
 			WHERE id=?`)
 		if err != nil {
 			return err
@@ -184,7 +223,8 @@ func (s *Store) WriteTick(ts int64, apps []*App, samples []Sample, events []Even
 		defer st.Close()
 		for _, a := range apps {
 			if _, err := st.Exec(a.Name, a.Source, a.Unit, a.Cwd, a.Command, a.PkgVersion,
-				a.Ports, a.Sockets, a.Domains, a.RootPID, a.RootStart, a.LastSeen, a.ID); err != nil {
+				a.Ports, a.Sockets, a.Domains, a.RootPID, a.RootStart, a.LastSeen,
+				a.Exe, a.PkgDir, a.Entry, a.UID, a.PM2Home, a.ID); err != nil {
 				return err
 			}
 		}
@@ -208,6 +248,13 @@ func (s *Store) WriteTick(ts int64, apps []*App, samples []Sample, events []Even
 		}
 	}
 	return tx.Commit()
+}
+
+// AddEvent records a single event outside a collection tick (user actions).
+func (s *Store) AddEvent(e Event) error {
+	_, err := s.db.Exec(`INSERT INTO events (app_id, ts, kind, detail) VALUES (?, ?, ?, ?)`,
+		e.AppID, e.TS, e.Kind, e.Detail)
+	return err
 }
 
 // Maintain rolls completed minutes/hours up and prunes expired rows.

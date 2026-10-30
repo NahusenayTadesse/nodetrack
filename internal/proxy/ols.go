@@ -66,19 +66,34 @@ func olsGet(ns []*olsNode, key string) string {
 	return ""
 }
 
-type olsVhost struct {
-	name, root string
-	domains    []string
-	tls        bool
-	body       []*olsNode
-}
-
 // proxyRule matches `RewriteRule ... HTTP://backend/... [P...]`.
 var proxyRule = regexp.MustCompile(`(?i)RewriteRule\s+\S+\s+https?://([^/\s]+)`)
 
-// OLSRoutes parses httpd_config.conf, every vhost.conf it references and
-// each vhost's .htaccess, and returns domain -> proxy backend routes.
-func OLSRoutes(confPath string) ([]Route, error) {
+// olsBackend is a proxy target used by a vhost.
+type olsBackend struct {
+	name  string // extprocessor name; host:port when a rule proxies directly
+	addr  string
+	path  string
+	local bool // defined in the vhost's own config file (safe to edit)
+}
+
+type olsVhost struct {
+	name, root   string
+	configFile   string
+	docRoot      string
+	htaccess     bool // autoLoadHtaccess on
+	domains      []string
+	tls          bool
+	backends     []olsBackend
+	body         []*olsNode
+	htaccessFile string
+}
+
+type olsModel struct {
+	vhosts []*olsVhost
+}
+
+func loadOLSModel(confPath string) (*olsModel, error) {
 	src, err := os.ReadFile(confPath)
 	if err != nil {
 		return nil, err
@@ -86,19 +101,15 @@ func OLSRoutes(confPath string) ([]Route, error) {
 	serverRoot := filepath.Dir(filepath.Dir(confPath)) // .../lsws/conf/x.conf -> .../lsws
 	top := parseOLS(string(src))
 
-	procs := map[string]string{} // extprocessor name -> address (type proxy)
-	collectProcs := func(ns []*olsNode) {
-		for _, n := range ns {
-			if n.isBlk && strings.EqualFold(n.key, "extprocessor") &&
-				strings.EqualFold(olsGet(n.block, "type"), "proxy") {
-				procs[n.value] = olsGet(n.block, "address")
-			}
+	global := map[string]string{} // extprocessor name -> address (type proxy)
+	for _, n := range top {
+		if isProxyProc(n) {
+			global[n.value] = olsGet(n.block, "address")
 		}
 	}
-	collectProcs(top)
 
-	vhosts := map[string]*olsVhost{}
-	var order []string
+	m := &olsModel{}
+	byName := map[string]*olsVhost{}
 	for _, n := range top {
 		if !n.isBlk || !strings.EqualFold(n.key, "virtualhost") {
 			continue
@@ -109,12 +120,13 @@ func OLSRoutes(confPath string) ([]Route, error) {
 		}
 		vh.root = strings.TrimSuffix(expand(olsGet(n.block, "vhRoot")), "/")
 		if cf := expand(olsGet(n.block, "configFile")); cf != "" {
+			vh.configFile = cf
 			if b, err := os.ReadFile(cf); err == nil {
 				vh.body = append(vh.body, parseOLS(string(b))...)
 			}
 		}
-		vhosts[vh.name] = vh
-		order = append(order, vh.name)
+		byName[vh.name] = vh
+		m.vhosts = append(m.vhosts, vh)
 	}
 
 	for _, n := range top {
@@ -122,12 +134,12 @@ func OLSRoutes(confPath string) ([]Route, error) {
 			continue
 		}
 		secure := olsGet(n.block, "secure") == "1" || strings.HasSuffix(olsGet(n.block, "address"), ":443")
-		for _, m := range n.block {
-			if m.isBlk || !strings.EqualFold(m.key, "map") {
+		for _, mp := range n.block {
+			if mp.isBlk || !strings.EqualFold(mp.key, "map") {
 				continue
 			}
-			name, list, _ := strings.Cut(m.value, " ")
-			vh := vhosts[name]
+			name, list, _ := strings.Cut(mp.value, " ")
+			vh := byName[name]
 			if vh == nil {
 				continue
 			}
@@ -140,9 +152,7 @@ func OLSRoutes(confPath string) ([]Route, error) {
 		}
 	}
 
-	var routes []Route
-	for _, name := range order {
-		vh := vhosts[name]
+	for _, vh := range m.vhosts {
 		expand := strings.NewReplacer("$VH_NAME", vh.name, "$VH_ROOT", vh.root, "$SERVER_ROOT", serverRoot).Replace
 		if len(vh.domains) == 0 {
 			if d := expand(olsGet(vh.body, "vhDomain")); d != "" {
@@ -154,77 +164,111 @@ func OLSRoutes(confPath string) ([]Route, error) {
 				}
 			}
 		}
-		if !vh.tls {
-			for _, n := range vh.body {
-				if n.isBlk && strings.EqualFold(n.key, "vhssl") {
-					vh.tls = true
-				}
-			}
-		}
-
 		local := map[string]string{}
-		for k, v := range procs {
-			local[k] = v
-		}
-		vhProcs := map[string]string{}
 		for _, n := range vh.body {
-			if n.isBlk && strings.EqualFold(n.key, "extprocessor") &&
-				strings.EqualFold(olsGet(n.block, "type"), "proxy") {
+			switch {
+			case n.isBlk && strings.EqualFold(n.key, "vhssl"):
+				vh.tls = true
+			case n.isBlk && strings.EqualFold(n.key, "rewrite"):
+				vh.htaccess = vh.htaccess || olsGet(n.block, "autoLoadHtaccess") == "1"
+			case isProxyProc(n):
 				local[n.value] = olsGet(n.block, "address")
-				vhProcs[n.value] = local[n.value]
 			}
 		}
 
 		used := map[string]string{} // backend -> path
+		var order []string
+		use := func(name, path string) {
+			if _, ok := used[name]; !ok {
+				used[name] = path
+				order = append(order, name)
+			}
+		}
 		for _, n := range vh.body {
 			switch {
 			case n.isBlk && strings.EqualFold(n.key, "context") &&
 				strings.EqualFold(olsGet(n.block, "type"), "proxy"):
 				if h := olsGet(n.block, "handler"); h != "" {
-					used[h] = n.value
+					use(h, n.value)
 				}
 			case n.isBlk && strings.EqualFold(n.key, "rewrite"):
-				for _, m := range proxyRule.FindAllStringSubmatch(olsGet(n.block, "rules"), -1) {
-					setDefault(used, m[1], "/")
+				for _, mm := range proxyRule.FindAllStringSubmatch(olsGet(n.block, "rules"), -1) {
+					use(mm[1], "/")
 				}
 			}
 		}
 		// CyberPanel's "Rewrite Rules" editor writes public_html/.htaccess.
-		docRoot := expand(olsGet(vh.body, "docRoot"))
-		if docRoot == "" && vh.root != "" {
-			docRoot = vh.root + "/public_html"
+		vh.docRoot = expand(olsGet(vh.body, "docRoot"))
+		if vh.docRoot == "" && vh.root != "" {
+			vh.docRoot = vh.root + "/public_html"
 		}
-		if docRoot != "" {
-			if b, err := os.ReadFile(filepath.Join(docRoot, ".htaccess")); err == nil {
-				for _, m := range proxyRule.FindAllStringSubmatch(string(b), -1) {
-					setDefault(used, m[1], "/")
+		if vh.docRoot != "" {
+			vh.htaccessFile = filepath.Join(vh.docRoot, ".htaccess")
+			if b, err := os.ReadFile(vh.htaccessFile); err == nil {
+				for _, mm := range proxyRule.FindAllStringSubmatch(string(b), -1) {
+					use(mm[1], "/")
 				}
 			}
 		}
 		// A proxy backend defined inside a vhost is meant for that vhost even
 		// if the rule using it lives somewhere we can't read.
-		for name := range vhProcs {
-			setDefault(used, name, "/")
+		var localNames []string
+		for name := range local {
+			localNames = append(localNames, name)
+		}
+		slices.Sort(localNames)
+		for _, name := range localNames {
+			use(name, "/")
 		}
 
-		for backend, path := range used {
-			addr, ok := local[backend]
-			if !ok {
-				addr = backend // rewrite straight to host:port
+		for _, name := range order {
+			b := olsBackend{name: name, path: used[name]}
+			switch addr, ok := local[name]; {
+			case ok:
+				b.addr, b.local = addr, true
+			case global[name] != "":
+				b.addr = global[name]
+			default:
+				b.addr = name // rewrite straight to host:port
 			}
-			t, ok := parseOLSAddr(addr)
+			vh.backends = append(vh.backends, b)
+		}
+	}
+	return m, nil
+}
+
+func isProxyProc(n *olsNode) bool {
+	return n.isBlk && strings.EqualFold(n.key, "extprocessor") &&
+		strings.EqualFold(olsGet(n.block, "type"), "proxy")
+}
+
+// OLSRoutes parses httpd_config.conf, every vhost.conf it references and
+// each vhost's .htaccess, and returns domain -> proxy backend routes.
+func OLSRoutes(confPath string) ([]Route, error) {
+	m, err := loadOLSModel(confPath)
+	if err != nil {
+		return nil, err
+	}
+	return m.routes(), nil
+}
+
+func (m *olsModel) routes() []Route {
+	var routes []Route
+	for _, vh := range m.vhosts {
+		for _, b := range vh.backends {
+			t, ok := parseOLSAddr(b.addr)
 			if !ok {
 				continue
 			}
 			for _, d := range vh.domains {
 				routes = append(routes, Route{
-					Domain: Domain{Host: d, Path: path, Source: "openlitespeed", TLS: vh.tls},
+					Domain: Domain{Host: d, Path: b.path, Source: "openlitespeed", TLS: vh.tls},
 					UpHost: t.host, UpPort: t.port, Socket: t.socket,
 				})
 			}
 		}
 	}
-	return routes, nil
+	return routes
 }
 
 func parseOLSAddr(a string) (target, bool) {
@@ -244,10 +288,4 @@ func parseOLSAddr(a string) (target, bool) {
 		return target{}, false
 	}
 	return t[0], true
-}
-
-func setDefault(m map[string]string, k, v string) {
-	if _, ok := m[k]; !ok {
-		m[k] = v
-	}
 }

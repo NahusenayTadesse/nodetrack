@@ -13,6 +13,8 @@
     isWildcard(p.addr)
       ? `Listening on all interfaces, port ${p.port} (reachable from outside unless firewalled)`
       : `Listening on ${p.addr || '*'}:${p.port}`;
+  // the same port on 127.0.0.1 and ::1 renders identically; show it once
+  const uniquePorts = $derived(ports.filter((p, i) => ports.findIndex((q) => portLabel(q) === portLabel(p)) === i));
   const shownDomains = $derived(domains.slice(0, limit));
   const hidden = $derived(Math.max(0, domains.length - shownDomains.length));
   const domainTitle = (d: Domain) => `${domainUrl(d)} (via ${d.source})`;
@@ -31,7 +33,7 @@
 {#if hidden > 0}
   <span class="chip more" title={domains.slice(limit).map((d) => d.host).join(', ')}>+{hidden}</span>
 {/if}
-{#each ports as p (p.addr + ':' + p.port)}
+{#each uniquePorts as p (p.addr + ':' + p.port)}
   <span class="chip port" class:public={isWildcard(p.addr)} title={portTitle(p)}>{portLabel(p)}</span>
 {/each}
 {#each sockets as s (s)}

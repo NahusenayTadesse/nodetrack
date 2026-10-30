@@ -95,3 +95,32 @@ export function coreList(cores: number[]): string {
 export function plural(n: number, one: string, many = one + 's'): string {
   return `${n} ${n === 1 ? one : many}`;
 }
+
+// CSI (colours, cursor moves), OSC (titles, hyperlinks) and other 2-char escapes.
+// eslint-disable-next-line no-control-regex
+const ANSI = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]|[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]/g;
+
+/**
+ * Turn raw process output into plain text: strip ANSI escapes and resolve
+ * carriage-return progress lines (keep what the terminal would show last).
+ */
+export function terminalText(raw: string): string {
+  const clean = raw.replace(ANSI, '').replace(/\r\n/g, '\n');
+  if (!clean.includes('\r')) return clean;
+  return clean
+    .split('\n')
+    .map((line) => {
+      const parts = line.split('\r');
+      // a trailing \r (e.g. before the next chunk) leaves an empty last part
+      for (let i = parts.length - 1; i >= 0; i--) if (parts[i]) return parts[i];
+      return '';
+    })
+    .join('\n');
+}
+
+/** Split a path into [head, tail] so the head can ellipsize and the tail stays visible. */
+export function splitPath(p: string): [string, string] {
+  const i = p.lastIndexOf('/', p.length - 2);
+  if (i <= 0) return ['', p];
+  return [p.slice(0, i), p.slice(i)];
+}

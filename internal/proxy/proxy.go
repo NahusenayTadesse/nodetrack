@@ -39,11 +39,16 @@ type Resolver struct {
 	mu       sync.RWMutex
 	nginx    []Route
 	ols      []Route
+	olsModel *olsModel
 	caddy    []Route
 	localIPs map[string]bool
 
+	refreshMu        sync.Mutex // serializes refreshes and guards the signatures
 	nginxSig, olsSig uint64
 }
+
+// RefreshNow re-reads proxy configs immediately (after an edit).
+func (r *Resolver) RefreshNow(ctx context.Context) { r.refresh(ctx) }
 
 // Run refreshes routes immediately and then periodically until ctx ends.
 func (r *Resolver) Run(ctx context.Context, every time.Duration) {
@@ -61,6 +66,8 @@ func (r *Resolver) Run(ctx context.Context, every time.Duration) {
 }
 
 func (r *Resolver) refresh(ctx context.Context) {
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
 	local := map[string]bool{"localhost": true, "0.0.0.0": true, "::": true}
 	if h, err := os.Hostname(); err == nil {
 		local[h] = true
@@ -73,8 +80,10 @@ func (r *Resolver) refresh(ctx context.Context) {
 		}
 	}
 
-	nginx, nginxChanged := loadIfChanged("nginx", r.NginxConf, &r.nginxSig, NginxRoutes)
-	ols, olsChanged := loadIfChanged("openlitespeed", r.OLSConf, &r.olsSig, OLSRoutes)
+	nginx, nginxChanged := loadIfChanged("nginx", r.NginxConf, &r.nginxSig, NginxRoutes,
+		func(rs []Route) int { return len(rs) })
+	ols, olsChanged := loadIfChanged("openlitespeed", r.OLSConf, &r.olsSig, loadOLSModel,
+		func(m *olsModel) int { return len(m.vhosts) })
 
 	var caddy []Route
 	caddyOK := false
@@ -91,7 +100,7 @@ func (r *Resolver) refresh(ctx context.Context) {
 		r.nginx = nginx
 	}
 	if olsChanged {
-		r.ols = ols
+		r.olsModel, r.ols = ols, ols.routes()
 	}
 	if r.CaddyAdmin != "" {
 		if caddyOK {
@@ -105,25 +114,26 @@ func (r *Resolver) refresh(ctx context.Context) {
 
 // loadIfChanged re-parses a file-based proxy config only when a file under
 // its directory changed since the last successful parse.
-func loadIfChanged(name, conf string, sig *uint64, parse func(string) ([]Route, error)) ([]Route, bool) {
+func loadIfChanged[T any](name, conf string, sig *uint64, parse func(string) (T, error), count func(T) int) (T, bool) {
+	var zero T
 	if conf == "" {
-		return nil, false
+		return zero, false
 	}
 	if _, err := os.Stat(conf); err != nil {
-		return nil, false
+		return zero, false
 	}
 	s := configSignature(conf)
 	if s == *sig {
-		return nil, false
+		return zero, false
 	}
-	routes, err := parse(conf)
+	v, err := parse(conf)
 	if err != nil {
 		slog.Warn("proxy config", "proxy", name, "err", err)
-		return nil, false
+		return zero, false
 	}
 	*sig = s
-	slog.Info("proxy routes loaded", "proxy", name, "count", len(routes))
-	return routes, true
+	slog.Info("proxy config loaded", "proxy", name, "items", count(v))
+	return v, true
 }
 
 // Match returns the domains that route to any of the given listeners or

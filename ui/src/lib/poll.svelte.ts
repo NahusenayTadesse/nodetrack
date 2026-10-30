@@ -12,6 +12,7 @@ export class Poll<T> {
   pending = $state(true);
   /** polling stopped because `stopOn` matched */
   stopped = $state(false);
+  #nonce = $state(0);
 
   constructor(opts: {
     source: () => (signal: AbortSignal) => Promise<T>;
@@ -19,6 +20,7 @@ export class Poll<T> {
     stopOn?: (err: unknown) => boolean;
   }) {
     $effect(() => {
+      void this.#nonce;
       const run = opts.source();
       const ms = opts.every();
       const ctrl = new AbortController();
@@ -51,5 +53,10 @@ export class Poll<T> {
         clearTimeout(timer);
       };
     });
+  }
+
+  /** Fetch again right away (keeps the current value until the new one lands). */
+  refresh() {
+    this.#nonce++;
   }
 }

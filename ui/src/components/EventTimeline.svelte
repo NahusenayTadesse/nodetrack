@@ -95,6 +95,18 @@
   .discovered .node {
     box-shadow: inset 0 0 0 2px var(--info);
   }
+  .action .node {
+    background: var(--info);
+    box-shadow: none;
+    border-radius: 2px;
+  }
+  .job .node {
+    box-shadow: inset 0 0 0 2px var(--accent);
+    border-radius: 2px;
+  }
+  .action .kind {
+    color: var(--info);
+  }
   .body {
     display: flex;
     gap: 10px;

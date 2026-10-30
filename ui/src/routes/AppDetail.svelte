@@ -9,9 +9,10 @@
     type AppDetail,
     type AppSummary,
     type History,
+    type Job,
     type Range
   } from '../lib/api';
-  import { bytes, coreList, datetime, duration, pct, plural, rate, relative } from '../lib/format';
+  import { bytes, coreList, duration, pct, plural, rate, relative } from '../lib/format';
   import { live } from '../lib/live.svelte';
   import { env } from '../lib/env.svelte';
   import { homeHref, router } from '../lib/router.svelte';
@@ -24,6 +25,12 @@
   import ProcessTable from '../components/ProcessTable.svelte';
   import EventTimeline from '../components/EventTimeline.svelte';
   import ForgetApp from '../components/ForgetApp.svelte';
+  import LocationPanel from '../components/LocationPanel.svelte';
+  import AppControls from '../components/AppControls.svelte';
+  import DomainPicker from '../components/DomainPicker.svelte';
+  import ScriptsPanel from '../components/ScriptsPanel.svelte';
+  import JobConsole from '../components/JobConsole.svelte';
+  import JobsList from '../components/JobsList.svelte';
 
   let { id }: { id: number } = $props();
 
@@ -83,6 +90,27 @@
   const cpus = $derived(live.data?.host.cpus ?? 0);
   const down = $derived(app?.status === 'down');
 
+  // Job console: seeded with a Job (just started, or picked from the recent list).
+  let consoleJob = $state<Job | null>(null);
+  /** id of a job we started that the detail poll may not list yet */
+  let pendingRunId = $state<string | null>(null);
+
+  const runningJob = $derived(
+    detail?.jobs.find((j) => j.status === 'running') ??
+      (pendingRunId && consoleJob?.id === pendingRunId ? consoleJob : undefined)
+  );
+
+  function onJobStarted(job: Job) {
+    consoleJob = job;
+    pendingRunId = job.id;
+    detailPoll.refresh();
+  }
+
+  function onJobFinished(job: Job) {
+    if (pendingRunId === job.id) pendingRunId = null;
+    detailPoll.refresh();
+  }
+
   function setRange(r: Range) {
     range = r;
     try {
@@ -128,6 +156,8 @@
     </div>
   {:else}
     <header class="hero" class:down>
+      <div class="top">
+      <div class="ident">
       <div class="titlebar">
         <StatusDot status={app.status} />
         <h1>{app.name}</h1>
@@ -151,8 +181,18 @@
           <span class="stale" title={detailError}>details stale</span>
         {/if}
       </p>
+      </div>
+      {#if detail}
+        <div class="ctrl">
+          <AppControls appId={app.id} appName={app.name} control={detail.control} onchanged={() => detailPoll.refresh()} />
+        </div>
+      {/if}
+      </div>
       <div class="endpoints">
         <Endpoints domains={app.domains} ports={app.ports} sockets={app.sockets} />
+        {#if detail?.control.enabled}
+          <DomainPicker appId={app.id} appName={app.name} ports={app.ports} onchanged={() => detailPoll.refresh()} />
+        {/if}
       </div>
 
       <dl class="stats">
@@ -186,41 +226,7 @@
       </dl>
     </header>
 
-    <section class="block" aria-labelledby="h-info">
-      <h2 id="h-info" class="visually-hidden">Details</h2>
-      <dl class="info">
-        <div><dt>cwd</dt><dd class="mono" title={app.cwd}>{app.cwd || '–'}</dd></div>
-        <div><dt>command</dt><dd class="mono cmd" title={app.command}>{app.command || '–'}</dd></div>
-        <div><dt>package</dt><dd class="mono">{app.pkgVersion ? `v${app.pkgVersion.replace(/^v/, '')}` : '–'}</dd></div>
-        <div>
-          <dt>git</dt>
-          <dd class="mono">
-            {#if detail?.git}
-              <span class="branch">{detail.git.branch || 'detached'}</span>
-              <span class="faint">@</span>
-              <span class="commit">{detail.git.commit.slice(0, 12)}</span>
-            {:else if detail}
-              <span class="faint">not a git repo</span>
-            {:else}
-              <span class="faint">…</span>
-            {/if}
-          </dd>
-        </div>
-        <div><dt>affinity</dt><dd class="mono">{app.affinity || '–'}</dd></div>
-        <div>
-          <dt>pids</dt>
-          <dd class="mono">{app.pids.length ? app.pids.join(', ') : '–'}</dd>
-        </div>
-        <div>
-          <dt>first seen</dt>
-          <dd class="num" title={datetime(app.firstSeen)}>{relative(app.firstSeen, env.now)}</dd>
-        </div>
-        <div>
-          <dt>started</dt>
-          <dd class="num" title={datetime(app.startedAt)}>{app.startedAt ? datetime(app.startedAt) : '–'}</dd>
-        </div>
-      </dl>
-    </section>
+    <LocationPanel {app} {detail} />
 
     <section class="charts-section" aria-labelledby="h-hist">
       <div class="section-head">
@@ -253,6 +259,33 @@
         />
       </div>
     </section>
+
+    {#if detail}
+      <div class="ops">
+        <ScriptsPanel
+          appId={app.id}
+          packageManager={detail.location?.packageManager ?? ''}
+          scripts={detail.scripts}
+          control={detail.control}
+          running={runningJob}
+          onstarted={onJobStarted}
+        />
+        <div class="jobs-col">
+          {#if consoleJob}
+            {#key consoleJob.id}
+              <JobConsole job={consoleJob} onclose={() => (consoleJob = null)} onfinished={onJobFinished} />
+            {/key}
+          {/if}
+          <section class="block" aria-labelledby="h-jobs">
+            <div class="block-head">
+              <h2 id="h-jobs">Recent jobs</h2>
+              {#if detail.jobs.length}<span class="count num">{detail.jobs.length}</span>{/if}
+            </div>
+            <JobsList jobs={detail.jobs} activeId={consoleJob?.id ?? null} onselect={(j) => (consoleJob = j)} />
+          </section>
+        </div>
+      </div>
+    {/if}
 
     <div class="split">
       <section class="block" aria-labelledby="h-procs">
@@ -323,6 +356,41 @@
     background: var(--surface);
     box-shadow: var(--shadow);
     overflow: hidden;
+  }
+  .top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px 20px;
+    flex-wrap: wrap;
+  }
+  .ident {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+    flex: 1 1 320px;
+  }
+  .ctrl {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+    min-width: 0;
+    max-width: 100%;
+    flex: 0 1 auto;
+  }
+  .ops {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr);
+    gap: 14px;
+    align-items: start;
+  }
+  .jobs-col {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 0;
   }
   .titlebar {
     display: flex;
@@ -450,36 +518,6 @@
     font-size: 13px;
   }
 
-  .info {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    margin: 0;
-  }
-  .info > div {
-    display: grid;
-    grid-template-columns: 92px minmax(0, 1fr);
-    gap: 12px;
-    align-items: baseline;
-    padding: 9px 16px;
-    border-top: 1px solid var(--border);
-    font-size: 13px;
-  }
-  .info > div:nth-child(-n + 2) {
-    border-top: 0;
-  }
-  .info > div:nth-child(even) {
-    border-left: 1px solid var(--border);
-  }
-  .info dd {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text-2);
-  }
-  .branch {
-    color: var(--accent);
-  }
-
   .charts-section {
     display: flex;
     flex-direction: column;
@@ -536,6 +574,7 @@
 
   @media (max-width: 1020px) {
     .charts,
+    .ops,
     .split {
       grid-template-columns: minmax(0, 1fr);
     }
@@ -558,6 +597,10 @@
     }
     h1 {
       font-size: 21px;
+    }
+    .ctrl {
+      align-items: stretch;
+      flex-basis: 100%;
     }
     .stats {
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -582,17 +625,6 @@
     }
     .big {
       font-size: 19px;
-    }
-    .info {
-      grid-template-columns: minmax(0, 1fr);
-    }
-    .info > div {
-      grid-template-columns: 78px minmax(0, 1fr);
-      border-left: 0 !important;
-      border-top: 1px solid var(--border) !important;
-    }
-    .info > div:first-child {
-      border-top: 0 !important;
     }
   }
 </style>

@@ -53,6 +53,10 @@
       <span>nodetrack {tracker.version.startsWith('v') ? tracker.version : 'v' + tracker.version}</span>
       <span class="sep">/</span>
       <span>every {tracker.interval}s</span>
+      {#if tracker.controls}
+        <span class="sep">/</span>
+        <span class="ctl" title="Start/stop, jobs and domain changes are enabled on this server">controls on</span>
+      {/if}
     </p>
   </div>
 </section>
@@ -134,6 +138,19 @@
   }
   .self .label {
     color: var(--accent);
+  }
+  .ctl {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--warn);
+  }
+  .ctl::before {
+    content: '';
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: currentColor;
   }
 
   @media (max-width: 960px) {

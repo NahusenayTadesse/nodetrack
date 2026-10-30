@@ -43,6 +43,14 @@
   --bun-bg: #f8ead3;
   --bun-fg: #7b4f22;
 
+  /* job console: a terminal in both themes */
+  --term-bg: #12140f;
+  --term-bar: #1a1d17;
+  --term-border: #2a2e26;
+  --term-fg: #d9dcd2;
+  --term-muted: #8b9084;
+  --term-accent: #5fdc92;
+
   --radius: 10px;
   --radius-sm: 6px;
   --shadow: 0 1px 0 rgba(23, 25, 21, 0.04), 0 1px 3px rgba(23, 25, 21, 0.05);
@@ -88,6 +96,10 @@
     --bun-fg: #f1cf9c;
 
     --shadow: 0 1px 0 rgba(0, 0, 0, 0.3);
+
+    --term-bg: #080907;
+    --term-bar: #10120e;
+    --term-border: #262a23;
   }
 }
 

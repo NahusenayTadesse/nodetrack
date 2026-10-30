@@ -47,7 +47,10 @@ After=network.target
 [Service]
 # Root because /proc is mounted hidepid=invisible and the OpenLiteSpeed
 # configs are root-only. The service itself only reads.
-ExecStart=/usr/local/bin/nodetrack -listen 127.0.0.1:$PORT -db /var/lib/nodetrack/nodetrack.db -caddy ""
+# -controls: start/stop/restart, package scripts and domain changes from the
+# dashboard. Scripts run as the app's owner in their own transient unit; domain
+# edits run as a separate root helper with backups and automatic rollback.
+ExecStart=/usr/local/bin/nodetrack -listen 127.0.0.1:$PORT -db /var/lib/nodetrack/nodetrack.db -caddy "" -controls
 EnvironmentFile=/etc/nodetrack.env
 NoNewPrivileges=yes
 ProtectSystem=strict

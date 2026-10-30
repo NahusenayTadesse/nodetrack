@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	Version  = "0.1.0"
+	Version  = "0.2.0"
 	sparkLen = 60
 )
 
@@ -34,6 +34,7 @@ type Config struct {
 	PortScan time.Duration  // full socket rescan period (also done on new processes)
 	Include  *regexp.Regexp // adopt matching processes even without ports
 	Exclude  *regexp.Regexp // never adopt matching processes
+	Controls bool           // reported to the UI; enforced by the control package
 }
 
 // proc is a cached node/bun (or other) process. Classification happens once
@@ -44,6 +45,9 @@ type proc struct {
 	comm  string
 
 	candidate  bool
+	uid        int
+	exe        string
+	pm2Home    string
 	runtime    string
 	argv       []string
 	script     string
@@ -81,7 +85,6 @@ type app struct {
 	spark     ring
 	summary   AppSummary
 	processes []Process
-	gitDir    string
 }
 
 type ring struct {
@@ -133,6 +136,7 @@ type Collector struct {
 	tick         uint64
 	lastTick     time.Time
 	lastPortScan time.Time
+	rescanUntil  time.Time // keep scanning sockets while new processes start up
 	prevHost     procfs.CPUTimes
 	host         Host
 
@@ -142,7 +146,7 @@ type Collector struct {
 	mu       sync.RWMutex
 	overview *Overview
 	details  map[int64][]Process
-	gitDirs  map[int64]string
+	targets  map[int64]Target
 	subs     map[chan []byte]struct{}
 }
 
@@ -153,7 +157,7 @@ func New(cfg Config, st *store.Store, px *proxy.Resolver) (*Collector, error) {
 		procs:  map[int]*proc{}, ppid: map[int]int{},
 		tcp: map[uint64]procfs.Listener{}, unix: map[uint64]string{},
 		apps: map[string]*app{}, forget: make(chan forgetReq),
-		subs: map[chan []byte]struct{}{},
+		subs: map[chan []byte]struct{}{}, targets: map[int64]Target{},
 	}
 	var err error
 	if c.bootTime, err = c.r.BootTime(); err != nil {
@@ -214,6 +218,8 @@ func (c *Collector) inspect(pid int, st procfs.Stat) *proc {
 	if p.runtime = runtimeOf(exe); p.runtime == "" {
 		return p
 	}
+	p.exe = exe
+	p.uid = procfs.UID(pid)
 	if ns, err := procfs.PIDNamespace(pid); err == nil && c.selfNS != "" && ns != c.selfNS {
 		return p // containerised
 	}
@@ -230,9 +236,10 @@ func (c *Collector) inspect(pid int, st procfs.Stat) *proc {
 	p.candidate = true
 	p.argv, p.script, p.cwd = argv, script, cwd
 	p.unit = systemdUnit(cg)
-	if env, err := c.r.Environ(pid, "pm_id", "name", "PORT"); err == nil {
+	if env, err := c.r.Environ(pid, "pm_id", "name", "PORT", "PM2_HOME"); err == nil {
 		if _, ok := env["pm_id"]; ok {
 			p.pm2Name = env["name"]
+			p.pm2Home = env["PM2_HOME"]
 		}
 		p.envPort, _ = strconv.Atoi(env["PORT"])
 	}
@@ -354,8 +361,13 @@ func (c *Collector) collect(now time.Time) {
 		}
 	}
 
-	// 2. Sockets: full rescan when something new appeared, else periodically.
-	scan := newCandidate || now.Sub(c.lastPortScan) >= c.cfg.PortScan
+	// 2. Sockets: a new process usually opens its port a moment after it
+	// starts, so rescan every tick for a minute after one appears; otherwise
+	// rescan periodically.
+	if newCandidate {
+		c.rescanUntil = now.Add(time.Minute)
+	}
+	scan := now.Before(c.rescanUntil) || now.Sub(c.lastPortScan) >= c.cfg.PortScan
 	if scan {
 		c.lastPortScan = now
 		if err := c.r.TCPListeners(c.tcp); err != nil {
@@ -507,6 +519,14 @@ func (c *Collector) fillRow(a *app, g *group, rootStart, now int64) {
 		r.Unit = root.unit
 	}
 	r.RootPID, r.RootStart, r.LastSeen = root.pid, rootStart, now
+	r.Exe, r.PkgDir, r.UID, r.PM2Home = root.exe, root.pkgDir, root.uid, root.pm2Home
+	r.Entry = ""
+	if root.script != "" && looksLikeFile(root.script, root.cwd) {
+		r.Entry = root.script
+		if !filepath.IsAbs(r.Entry) {
+			r.Entry = filepath.Join(root.cwd, r.Entry)
+		}
+	}
 	slices.SortFunc(g.listeners, func(x, y procfs.Listener) int {
 		return cmp.Or(cmp.Compare(x.Port, y.Port), strings.Compare(x.Addr, y.Addr))
 	})
@@ -514,7 +534,6 @@ func (c *Collector) fillRow(a *app, g *group, rootStart, now int64) {
 	r.Ports = mustJSON(g.listeners)
 	r.Sockets = mustJSON(g.sockets)
 	r.Domains = mustJSON(c.proxy.Match(g.listeners, g.sockets))
-	a.gitDir = cmp.Or(root.pkgDir, root.cwd)
 }
 
 func (c *Collector) measure(a *app, g *group, scanned bool, elapsed float64) {
@@ -609,16 +628,22 @@ func (c *Collector) sampleHost(elapsed float64) {
 func (c *Collector) publish() {
 	ov := &Overview{
 		Host:    c.host,
-		Tracker: Tracker{RSS: c.r.SelfRSS(), Interval: int(c.cfg.Interval.Seconds()), Version: Version},
+		Tracker: Tracker{RSS: c.r.SelfRSS(), Interval: int(c.cfg.Interval.Seconds()), Version: Version, Controls: c.cfg.Controls},
 		Apps:    make([]AppSummary, 0, len(c.apps)),
 	}
 	details := make(map[int64][]Process, len(c.apps))
-	gitDirs := make(map[int64]string, len(c.apps))
+	targets := make(map[int64]Target, len(c.apps))
 	for _, a := range c.apps {
 		a.summary.Restarts = a.restarts
 		ov.Apps = append(ov.Apps, a.summary)
 		details[a.row.ID] = a.processes
-		gitDirs[a.row.ID] = cmp.Or(a.gitDir, a.row.Cwd)
+		targets[a.row.ID] = Target{
+			ID: a.row.ID, Name: a.row.Name, Runtime: a.row.Runtime, Source: a.row.Source,
+			Unit: a.row.Unit, Up: a.up, RootPID: a.row.RootPID, PIDs: a.summary.PIDs,
+			UID: a.row.UID, Cwd: a.row.Cwd, Dir: cmp.Or(a.row.PkgDir, a.row.Cwd),
+			Entry: a.row.Entry, Exe: a.row.Exe, PM2Home: a.row.PM2Home,
+			Ports: a.summary.Ports, Sockets: a.summary.Sockets,
+		}
 	}
 	slices.SortFunc(ov.Apps, func(x, y AppSummary) int {
 		if x.Status != y.Status {
@@ -628,7 +653,7 @@ func (c *Collector) publish() {
 	})
 
 	c.mu.Lock()
-	c.overview, c.details, c.gitDirs = ov, details, gitDirs
+	c.overview, c.details, c.targets = ov, details, targets
 	var msg []byte
 	if len(c.subs) > 0 {
 		msg, _ = json.Marshal(ov)
@@ -659,7 +684,7 @@ func (c *Collector) Detail(id int64) (*AppDetail, error) {
 			}
 		}
 	}
-	gitDir := c.gitDirs[id]
+	t := c.targets[id]
 	c.mu.RUnlock()
 	if d == nil {
 		return nil, ErrNotFound
@@ -671,8 +696,29 @@ func (c *Collector) Detail(id int64) (*AppDetail, error) {
 	if d.Events, err = c.store.Events(id, 50); err != nil {
 		return nil, err
 	}
-	d.Git = gitInfo(gitDir)
+	d.Git = gitInfo(t.Dir)
+	d.Location = location(t)
+	d.Scripts = Scripts(t.Dir)
 	return d, nil
+}
+
+// Target returns what the control package needs to act on an app.
+func (c *Collector) Target(id int64) (Target, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	t, ok := c.targets[id]
+	return t, ok
+}
+
+// Targets returns every known app.
+func (c *Collector) Targets() []Target {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]Target, 0, len(c.targets))
+	for _, t := range c.targets {
+		out = append(out, t)
+	}
+	return out
 }
 
 func (c *Collector) History(id int64, rng string) (*store.History, error) {
